@@ -139,6 +139,8 @@ if TYPE_CHECKING:
     from crewai_files import FileInput
 
     from crewai.context import ExecutionContext
+    from crewai.hooks.contexts import InterceptionContext
+    from crewai.hooks.dispatch import InterceptionPoint
     from crewai.llms.base_llm import BaseLLM
 
 from crewai.flow.visualization import build_flow_structure, render_interactive
@@ -1575,8 +1577,11 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             flow=self, output=final_result, payload=final_result
         )
         # Flag set before dispatching so an EXECUTION_END hook that raises
-        # HookAborted does not trigger a second (failure) dispatch upstream.
-        if hook_state is not None:
+        # HookAborted does not trigger a second (failure) dispatch upstream. A
+        # skipped dispatch leaves it false, matching the kickoff path.
+        if hook_state is not None and not self._skip_interception(
+            InterceptionPoint.EXECUTION_END
+        ):
             hook_state["end_dispatched"] = True
         self._dispatch_interception(InterceptionPoint.EXECUTION_END, end_ctx)
         final_result = end_ctx.payload
@@ -2188,7 +2193,6 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 ExecutionEndContext,
                 ExecutionStartContext,
                 InputContext,
-                InterceptionContext,
                 OutputContext,
             )
             from crewai.hooks.dispatch import HookAborted, InterceptionPoint
@@ -2201,10 +2205,9 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     inputs=inputs if inputs is not None else {},
                     payload=inputs,
                 )
-                if self._dispatch_interception(
+                execution_start_dispatched = self._dispatch_interception(
                     InterceptionPoint.EXECUTION_START, boundary_ctx
-                ):
-                    execution_start_dispatched = True
+                )
                 inputs = boundary_ctx.payload
 
                 boundary_ctx = InputContext(
@@ -2429,8 +2432,12 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 flow=self, output=final_output, payload=final_output
             )
             # Flag set before dispatching so an EXECUTION_END hook that raises
-            # HookAborted does not trigger a second (failure) dispatch below.
-            execution_end_dispatched = True
+            # HookAborted does not trigger a second (failure) dispatch below. A
+            # skipped dispatch leaves it false, so it means the same as
+            # ``execution_start_dispatched``.
+            execution_end_dispatched = not self._skip_interception(
+                InterceptionPoint.EXECUTION_END
+            )
             self._dispatch_interception(InterceptionPoint.EXECUTION_END, end_ctx)
             final_output = end_ctx.payload
 
@@ -2522,11 +2529,25 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             detach(flow_token)
             crewai_event_bus._exit_runtime_scope(runtime_scope)
 
-    def _skip_interception(self) -> bool:
-        return getattr(type(self), "is_crewai_internal", False)
+    def _skip_interception(self, point: InterceptionPoint) -> bool:
+        """Whether ``point`` must not be dispatched for this flow.
 
-    def _dispatch_interception(self, point: Any, ctx: Any) -> bool:
-        if self._skip_interception():
+        Per point rather than per flow: an internal flow that is itself the
+        whole run (a standalone agent) still owns its execution boundary, even
+        though its methods are never a caller's steps. See
+        ``AgentExecutor._skip_interception``.
+        """
+        return type(self).is_crewai_internal
+
+    def _dispatch_interception(
+        self, point: InterceptionPoint, ctx: InterceptionContext
+    ) -> bool:
+        """Dispatch ``point`` unless this flow is crewai's own bookkeeping.
+
+        Returns whether the dispatch happened, so callers can keep the
+        EXECUTION_START/EXECUTION_END pairing honest on a skipped flow.
+        """
+        if self._skip_interception(point):
             return False
         from crewai.hooks.dispatch import dispatch
 
@@ -2855,9 +2876,12 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 if future:
                     self._event_futures.append(future)
 
-            if not self._skip_interception():
+            from crewai.hooks.dispatch import InterceptionPoint
+
+            # Guarded here as well as inside the dispatch: a skipped flow must
+            # not pay for building the context or reversing the param mapping.
+            if not self._skip_interception(InterceptionPoint.PRE_STEP):
                 from crewai.hooks.contexts import StepContext
-                from crewai.hooks.dispatch import InterceptionPoint
 
                 pre_step_ctx = StepContext(
                     kind="flow_method",
@@ -2914,9 +2938,8 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     method_name, method_definition.human_feedback, result
                 )
 
-            if not self._skip_interception():
+            if not self._skip_interception(InterceptionPoint.POST_STEP):
                 from crewai.hooks.contexts import StepContext
-                from crewai.hooks.dispatch import InterceptionPoint
 
                 post_step_ctx = StepContext(
                     kind="flow_method",

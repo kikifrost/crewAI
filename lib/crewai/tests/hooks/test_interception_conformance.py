@@ -8,6 +8,7 @@ sees a well-shaped payload, an in-place/returned modification is honored, and a
 from __future__ import annotations
 
 import asyncio
+from typing import ClassVar
 from unittest.mock import patch
 
 from crewai.agent import Agent
@@ -26,6 +27,7 @@ from crewai.hooks.dispatch import (
     clear_all,
     on,
 )
+from crewai.llm import LLM
 from crewai.task import Task
 import pytest
 
@@ -48,7 +50,7 @@ class _SimpleFlow(Flow):
 
 
 class _InternalFlow(Flow):
-    is_crewai_internal = True
+    is_crewai_internal: ClassVar[bool] = True
 
     @start()
     def begin(self):
@@ -257,6 +259,91 @@ class TestFlowStepPoints:
 
         assert _QuietFlow().kickoff() == "ok"
         assert fired == ["pre:begin", "post:begin"]
+
+
+class TestCrewaiInternalFlows:
+    """The agent executor runs for real here.
+
+    Patching ``Agent.execute_task`` skips the very flow whose dispatches used
+    to leak into the caller's run, so only a real executor proves the skip.
+    """
+
+    _POINTS = (
+        InterceptionPoint.EXECUTION_START,
+        InterceptionPoint.INPUT,
+        InterceptionPoint.PRE_STEP,
+        InterceptionPoint.POST_STEP,
+        InterceptionPoint.OUTPUT,
+        InterceptionPoint.EXECUTION_END,
+    )
+
+    @staticmethod
+    def _agent() -> Agent:
+        return Agent(
+            role="Writer",
+            goal="Write",
+            backstory="Writes things.",
+            llm=LLM(model="gpt-4o-mini"),
+        )
+
+    @classmethod
+    def _record(cls) -> list[tuple[str, str | None]]:
+        fired: list[tuple[str, str | None]] = []
+        for point in cls._POINTS:
+
+            @on(point)
+            def _probe(ctx, _point=point):
+                fired.append((_point.value, getattr(ctx, "kind", None)))
+
+        return fired
+
+    def test_crew_run_dispatches_only_the_crews_own_points(self):
+        fired = self._record()
+        agent = self._agent()
+        task = Task(
+            description="Write something", expected_output="Some text", agent=agent
+        )
+
+        with patch.object(type(agent.llm), "call", return_value="Final Answer: done"):
+            Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+
+        assert fired == [
+            ("execution_start", None),
+            ("input", None),
+            ("pre_step", "task"),
+            ("post_step", "task"),
+            ("output", None),
+            ("execution_end", None),
+        ]
+
+    def test_standalone_agent_kickoff_keeps_its_execution_boundary(self):
+        fired = self._record()
+        agent = self._agent()
+
+        with patch.object(type(agent.llm), "call", return_value="Final Answer: done"):
+            agent.kickoff("write something")
+
+        assert fired == [
+            ("execution_start", None),
+            ("input", None),
+            ("output", None),
+            ("execution_end", None),
+        ]
+
+    def test_standalone_agent_kickoff_is_blockable(self):
+        @on(InterceptionPoint.EXECUTION_START)
+        def block(ctx):
+            raise HookAborted(reason="not allowed", source="policy")
+
+        agent = self._agent()
+
+        with patch.object(
+            type(agent.llm), "call", return_value="Final Answer: done"
+        ) as call:
+            with pytest.raises(HookAborted):
+                agent.kickoff("write something")
+
+        call.assert_not_called()
 
 
 class TestTaskStepPoints:

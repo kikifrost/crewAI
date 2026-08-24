@@ -1296,12 +1296,7 @@ def test_infrastructure_flows_suppress_flow_events_by_default():
 
 
 def test_infrastructure_flows_are_marked_internal():
-    """Pin the infra flows that must skip interception hooks.
-
-    ``_dispatch_interception`` only helps if these classes set
-    ``is_crewai_internal``; without this guard, removing the marker from
-    AgentExecutor would leak executor and memory kickoffs into policy points.
-    """
+    """Pin the marker; only the executor's skip has a behavioral test."""
     from crewai.experimental.agent_executor import AgentExecutor
     from crewai.memory.encoding_flow import EncodingFlow
     from crewai.memory.recall_flow import RecallFlow

@@ -56,6 +56,7 @@ from crewai.events.types.tool_usage_events import (
 )
 from crewai.flow.flow import Flow, listen, or_, router, start
 from crewai.flow.types import FlowMethodName
+from crewai.hooks.dispatch import InterceptionPoint
 from crewai.hooks.llm_hooks import (
     get_after_llm_call_hooks,
     get_before_llm_call_hooks,
@@ -130,6 +131,15 @@ if TYPE_CHECKING:
     from crewai.tools.tool_types import ToolResult
 
 _RouteT = TypeVar("_RouteT", bound=str)
+
+_EXECUTION_BOUNDARY_POINTS = frozenset(
+    {
+        InterceptionPoint.EXECUTION_START,
+        InterceptionPoint.INPUT,
+        InterceptionPoint.OUTPUT,
+        InterceptionPoint.EXECUTION_END,
+    }
+)
 
 
 class AgentExecutorState(BaseModel):
@@ -243,6 +253,18 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
         self.tracing = current_tracing if current_tracing else None
         self._flow_post_init()
         return self
+
+    def _skip_interception(self, point: InterceptionPoint) -> bool:
+        """Hide the executor's own steps, but not a standalone agent's run.
+
+        Crew-bound, the crew dispatches the execution boundary and these
+        methods are routing labels, not the caller's steps. Standalone
+        (``Agent.kickoff()``) nothing sits above the executor, so skipping the
+        boundary too would leave the run with no interception at all.
+        """
+        if self.crew is None and point in _EXECUTION_BOUNDARY_POINTS:
+            return False
+        return True
 
     def _check_native_tool_support(self) -> bool:
         """Check if LLM supports native function calling."""
